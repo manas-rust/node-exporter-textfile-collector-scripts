@@ -11,60 +11,76 @@ import errno
 import glob
 import os
 import sys
+from collections import defaultdict
+from typing import Dict, Any
 from prometheus_client import CollectorRegistry, Gauge, generate_latest
 
 
-def main():
-    processes_linking_deleted_libraries = {}
+def process_maps_entry(
+    path: str, line_parts: list, processes_linking_deleted_libraries: dict
+):
+    if len(line_parts) != 7:
+        return
+    library = line_parts[5]
+    comment = line_parts[6]
 
-    for path in glob.glob('/proc/*/maps'):
-        try:
-            with open(path, 'rb') as file:
-                for line in file:
-                    part = line.decode().strip().split()
+    if "/lib/" in library and "(deleted)" in comment:
+        if path not in processes_linking_deleted_libraries:
+            processes_linking_deleted_libraries[path] = defaultdict(int)
+        processes_linking_deleted_libraries[path].setdefault(library, 0)
+        processes_linking_deleted_libraries[path][library] += 1
 
-                    if len(part) == 7:
-                        library = part[5]
-                        comment = part[6]
 
-                        if '/lib/' in library and '(deleted)' in comment:
-                            if path not in processes_linking_deleted_libraries:
-                                processes_linking_deleted_libraries[path] = {}
-
-                                if library in processes_linking_deleted_libraries[path]:
-                                    processes_linking_deleted_libraries[path][library] += 1
-                                else:
-                                    processes_linking_deleted_libraries[path][library] = 1
-        except EnvironmentError as e:
-            # Ignore non-existent files, since the files may have changed since
-            # we globbed.
-            if e.errno != errno.ENOENT:
-                sys.exit('Failed to open file: {0}'.format(path))
-
-    num_processes_per_library = {}
+def count_processes_per_library(
+    processes_linking_deleted_libraries: Dict[str, Dict[str, Any]],
+) -> Dict[str, int]:
+    num_processes_per_library = defaultdict(int)
 
     for process, library_count in processes_linking_deleted_libraries.items():
-        libraries_seen = set()
-        for library, count in library_count.items():
-            if library in libraries_seen:
-                continue
+        # Skip the process if its value is not a dictionary
+        if not isinstance(library_count, dict):
+            continue
 
-            libraries_seen.add(library)
-            if library in num_processes_per_library:
-                num_processes_per_library[library] += 1
-            else:
-                num_processes_per_library[library] = 1
+        for library in library_count:
+            num_processes_per_library.setdefault(library, 0)
+            num_processes_per_library[library] += 1
+
+    return num_processes_per_library
+
+
+def main():
+    processes_linking_deleted_libraries = defaultdict(lambda: defaultdict(int))
+
+    for path in glob.glob("/proc/*/maps"):
+        try:
+            with open(path, "rb") as file:
+                for line in file:
+                    process_maps_entry(
+                        path,
+                        line.decode().strip().split(),
+                        processes_linking_deleted_libraries,
+                    )
+        except (EnvironmentError, PermissionError) as e:
+            if e.errno != errno.ENOENT:
+                sys.exit(f"Failed to open file: {path}")
+
+    num_processes_per_library = count_processes_per_library(
+        processes_linking_deleted_libraries
+    )
 
     registry = CollectorRegistry()
-    g = Gauge('node_processes_linking_deleted_libraries',
-              'Count of running processes that link a deleted library',
-              ['library_path', 'library_name'], registry=registry)
+    g = Gauge(
+        "node_processes_linking_deleted_libraries",
+        "Count of running processes that link a deleted library",
+        ["library_path", "library_name"],
+        registry=registry,
+    )
 
     for library, count in num_processes_per_library.items():
         dir_path, basename = os.path.split(library)
         g.labels(dir_path, basename).set(count)
 
-    print(generate_latest(registry).decode(), end='')
+    print(generate_latest(registry).decode(), end="")
 
 
 if __name__ == "__main__":
